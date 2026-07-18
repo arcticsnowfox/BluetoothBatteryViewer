@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version change
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $versionJson = Get-Content -Raw ver.json | ConvertFrom-Json
+          $version = [string]$versionJson.version
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw 'ver.json must contain a non-empty "version" value.'
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Version '$version' must look like 1.2.3 or 1.2.3.4."
+          }
+
+          $changed = '${{ github.event_name }}' -eq 'workflow_dispatch'
+          $oldVersion = ''
+
+          if ('${{ github.event_name }}' -eq 'push') {
+            $before = '${{ github.event.before }}'
+            if ([string]::IsNullOrWhiteSpace($before) -or $before -match '^0+$') {
+              $changed = $true
+            } else {
+              $oldJson = git show "${before}:ver.json" 2>$null
+              if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($oldJson -join "`n"))) {
+                $changed = $true
+              } else {
+                $oldVersion = [string](($oldJson -join "`n") | ConvertFrom-Json).version
+                $changed = $oldVersion -ne $version
+              }
+            }
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "changed=$($changed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+          "Detected version: $version"
+          if ($oldVersion) {
+            "Previous version: $oldVersion"
+          }
+          "Version changed: $changed"
+
+      - name: Skip unchanged version
+        if: steps.version.outputs.changed != 'true'
+        shell: pwsh
+        run: |
+          "ver.json version did not change; skipping release build."
+
+      - name: Setup NuGet
+        if: steps.version.outputs.changed == 'true'
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          nuget restore BluetoothBatteryViewer.sln
+
+      - name: Setup MSBuild
+        if: steps.version.outputs.changed == 'true'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Stamp assembly version
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $assemblyInfo = 'BluetoothBatteryViewer\Properties\AssemblyInfo.cs'
+          $assemblyVersion = $env:APP_VERSION
+          if (($assemblyVersion -split '\.').Count -eq 3) {
+            $assemblyVersion = "$assemblyVersion.0"
+          }
+
+          $content = Get-Content -Raw $assemblyInfo
+          $content = $content -replace 'AssemblyVersion\("[^"]+"\)', "AssemblyVersion(`"$assemblyVersion`")"
+          $content = $content -replace 'AssemblyFileVersion\("[^"]+"\)', "AssemblyFileVersion(`"$assemblyVersion`")"
+          Set-Content -Path $assemblyInfo -Value $content -Encoding UTF8
+
+      - name: Build x64 release
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          msbuild BluetoothBatteryViewer.sln /m /restore:false /p:Configuration=Release /p:Platform="Any CPU" /p:PlatformTarget=x64 /p:Prefer32Bit=false /p:DebugSymbols=false /p:DebugType=None
+
+      - name: Prepare zip package
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $source = Resolve-Path 'BluetoothBatteryViewer\bin\Release'
+          $packageRoot = "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64"
+          Remove-Item artifacts -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          New-Item -ItemType Directory -Force $packageRoot | Out-Null
+
+          Copy-Item "$source\*" $packageRoot -Recurse -Force
+          Get-ChildItem $packageRoot -Recurse -Include *.pdb | Remove-Item -Force
+          Remove-Item "$packageRoot\Bluetooth battery\settings.json" -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$packageRoot\*" -DestinationPath "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64.zip" -Force
+
+      - name: Install Inno Setup
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Build setup package
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $isccCandidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            throw 'ISCC.exe was not found after installing Inno Setup.'
+          }
+
+          $sourceDir = (Resolve-Path "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64").Path
+          $outputDir = (Resolve-Path 'artifacts').Path
+          & $iscc 'install\BluetoothBatteryViewer.iss' "/DAppVersion=$env:APP_VERSION" "/DSourceDir=$sourceDir" "/DOutputDir=$outputDir"
+
+      - name: Verify release assets
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $assets = @(
+            "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64.zip",
+            "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64-setup.exe"
+          )
+
+          foreach ($asset in $assets) {
+            if (-not (Test-Path $asset)) {
+              throw "Missing release asset: $asset"
+            }
+
+            $file = Get-Item $asset
+            if ($file.Length -le 0) {
+              throw "Release asset is empty: $asset"
+            }
+          }
+
+      - name: Upload workflow artifacts
+        if: steps.version.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BluetoothBatteryViewer-${{ steps.version.outputs.version }}-win-x64
+          path: |
+            artifacts/*.zip
+            artifacts/*-setup.exe
+
+      - name: Publish GitHub release
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = "v$env:APP_VERSION"
+          $assets = @(
+            "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64.zip",
+            "artifacts\BluetoothBatteryViewer-$env:APP_VERSION-win-x64-setup.exe"
+          )
+
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          $ErrorActionPreference = $previousErrorActionPreference
+
+          if ($releaseExists) {
+            gh release upload $tag $assets --clobber
+          } else {
+            gh release create $tag $assets --target '${{ github.sha }}' --title "BluetoothBatteryViewer $env:APP_VERSION" --notes "Automated release for version $env:APP_VERSION."
+          }
